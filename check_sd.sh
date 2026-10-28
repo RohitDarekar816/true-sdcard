@@ -1,104 +1,199 @@
 #!/usr/bin/env bash
-# Checks an SD card for fake capacity, speed and A2 rating using f3 (Fight Flash Fraud) and fio.
-# Usage: ./check_sd.sh [--quick] [mount_point]   (default: /media/rohitdarekar/disk)
-#   default : fills free space with test files and verifies them (non-destructive, hours)
+# SD card checker for the team: verifies real capacity (f3), sequential speed (V/U/Class rating) and
+# random IOPS (A1/A2) against what the card claims, and appends one row per card to a results CSV.
+#
+# Usage:
+#   ./check_sd.sh [--quick] [mount_point]   test a card (no mount point = pick from inserted cards)
+#   ./check_sd.sh --summary [csv ...]       count genuine/fake cards across result files
+#
+#   default : fills free space with test files and verifies them (keeps your files, ~1 hour per 64GB)
 #   --quick : f3probe --destructive on the raw device (WIPES the card, minutes), then reformats it exFAT
+#
+# Results go to $SD_RESULTS (default: sd_results.csv next to this script). Point it at a shared folder
+# so the whole team's results land in one file, or collect everyone's files and run --summary on them.
+# Needs (Ubuntu/Debian): sudo apt install f3 fio jq exfatprogs
 set -euo pipefail
+
+RESULTS="${SD_RESULTS:-$(dirname "$(readlink -f "$0")")/sd_results.csv}"
+HEADER="date,tester,host,brand,claimed_gb,speed_class,app_class,seller,mode,device_gb,usable,capacity_verdict,write_mbs,read_mbs,speed_verdict,read_iops,write_iops,app_verdict,usb_mbps"
+
+if [[ "${1:-}" == "--summary" ]]; then
+  shift
+  (( $# )) || set -- "$RESULTS"
+  for f in "$@"; do [[ -f "$f" ]] || { echo "No results file: $f"; exit 1; }; done
+  awk -F, 'FNR==1 {next}
+    {n++; v[$12]++; k=tolower($4" / "$8); t[k]++; if ($12=="FAKE") f[k]++}
+    END {
+      if (!n) {print "No results yet."; exit}
+      printf "Cards tested: %d\n", n
+      for (x in v) printf "  %-12s %d\n", x, v[x]
+      print "\nBy brand / seller (fake / total):"
+      for (x in t) printf "  %-45s %d / %d\n", x, f[x]+0, t[x]
+    }' "$@"
+  exit 0
+fi
 
 QUICK=0
 [[ "${1:-}" == "--quick" ]] && { QUICK=1; shift; }
-MNT="${1:-/media/rohitdarekar/disk}"
 
-for c in f3write f3probe fio jq mkfs.exfat; do
+for c in f3write f3read f3probe fio jq mkfs.exfat; do
   command -v "$c" >/dev/null || { echo "$c not installed. Run: sudo apt install f3 fio jq exfatprogs"; exit 1; }
 done
+
+# A card is on a USB reader, a removable disk, or a built-in SD slot (mmcblk). Guards against wiping system drives.
+is_card_disk() { [[ "$(lsblk -dno TRAN "/dev/$1")" == usb || "$(lsblk -dno RM "/dev/$1" | tr -d ' ')" == 1 || "$1" == mmcblk* ]]; }
+
+MNT="${1:-}"
+if [[ -z "$MNT" ]]; then
+  mapfile -t cands < <(lsblk -Jpo NAME,PKNAME,MOUNTPOINT | jq -r '.blockdevices[] | recurse(.children[]?)
+      | select(.pkname != null and .mountpoint != null) | "\(.pkname)\t\(.mountpoint)"' \
+    | while IFS=$'\t' read -r pk mnt; do if is_card_disk "${pk##*/}"; then echo "$mnt"; fi; done)
+  case ${#cands[@]} in
+    0) echo "No mounted SD card found. Insert the card, let it mount, or pass its mount point."; exit 1 ;;
+    1) MNT=${cands[0]} ;;
+    *) echo "Several cards found, pick one:"; select MNT in "${cands[@]}"; do [[ -n "$MNT" ]] && break; done ;;
+  esac
+fi
 mountpoint -q "$MNT" || { echo "$MNT is not a mount point"; exit 1; }
 
 PART=$(findmnt -no SOURCE "$MNT")
 PK=$(lsblk -no PKNAME "$PART")
 [[ -n "$PK" ]] || { echo "$PART has no parent disk (card has no partition table?). Cannot continue."; exit 1; }
 DISK=/dev/$PK
+is_card_disk "$PK" || { echo "$DISK is not a USB/removable/SD-slot device. Refusing to test it."; exit 1; }
+LOG=$(mktemp -d)   # fresh per run, so a verdict can never come from an older run's log
 
-echo "== Card info =="
+DEV_BYTES=$(lsblk -bdno SIZE "$DISK")
+DEV_GB=$(awk -v b="$DEV_BYTES" 'BEGIN {printf "%.1f", b / 1e9}')
+d=$(readlink -f "/sys/block/$PK"); while [[ $d != / && ! -f $d/speed ]]; do d=$(dirname "$d"); done
+USB=$(cat "$d/speed" 2>/dev/null || echo n/a)
+
+echo "== Card found =="
 df -h "$MNT"
 lsblk -o NAME,SIZE,MODEL,TRAN,RM "$DISK"
+[[ $USB == n/a ]] || echo "Reader USB link: $USB Mbps $([[ $USB == 480 ]] && echo '(USB 2.0: speeds above ~35 MB/s cannot be measured)')"
 echo
+
+echo "== Describe the card (as printed on it / in the listing) =="
+# read || exit: on Ctrl-D/closed input, stop instead of looping forever on the validation prompts.
+ask() { local a; read -rp "$1: " a || exit 1; a=${a:-$2}; tr -d ',"\r\n' <<<"$a"; }   # strip CSV-breaking chars
+speed_req() { case $1 in V90) echo 90 ;; V60) echo 60 ;; V30|U3) echo 30 ;; V10|U1|C10) echo 10 ;; V6|C6) echo 6 ;; C4) echo 4 ;; NONE) echo 0 ;; *) return 1 ;; esac; }
+TESTER=$(ask "Your name [$USER]" "$USER")
+BRAND=$(ask "Brand (e.g. SanDisk, Samsung, Acer)" unknown)
+while :; do CLAIMED=$(ask "Capacity printed on the card, in GB (e.g. 64)" ""); [[ "$CLAIMED" =~ ^[1-9][0-9]*$ ]] && break; echo "  Enter a number like 64 (no leading zero)."; done
+while :; do SPEED=$(ask "Speed class: V10/V30/V60/V90, U1/U3, C10/C6/C4, or Enter for none" NONE); SPEED=${SPEED^^}
+  REQ=$(speed_req "$SPEED") && break; echo "  Use one of: V10 V30 V60 V90 U1 U3 C10 C6 C4"; done
+while :; do APP=$(ask "App class: A1/A2, or Enter for none" NONE); APP=${APP^^}; [[ $APP =~ ^(A1|A2|NONE)$ ]] && break; echo "  Use A1, A2 or Enter."; done
+SELLER=$(ask "Bought from (e.g. Flipkart / Amazon + seller name)" unknown)
+echo
+
+# Real cards report slightly less than the label (64GB label ~ 62GB). Fakes usually report the label size, so f3 is the real test.
+(( DEV_BYTES * 100 >= CLAIMED * 90 * 1000000000 )) || echo "WARNING: card reports only $DEV_GB GB but is labelled $CLAIMED GB."
+
 if (( QUICK )); then
-  # Refuse anything that isn't a removable/USB disk, so a wrong mount point can't wipe a system drive.
-  [[ "$(lsblk -dno TRAN "$DISK")" == usb || "$(lsblk -dno RM "$DISK" | tr -d ' ')" == 1 ]] \
-    || { echo "$DISK is not removable/USB. Refusing to wipe it."; exit 1; }
   echo "QUICK mode will ERASE EVERYTHING on $DISK and reformat it as exFAT."
   read -rp "Type the device name ($DISK) to confirm: " ans
   [[ "$ans" == "$DISK" ]] || { echo "Aborted."; exit 0; }
+  sudo -v   # ask for the password now, not minutes later when the tests reach f3probe
 else
   echo "This fills ALL free space on $MNT with test files (*.h2w), then verifies them."
-  echo "Existing files are not touched. ~256GB can take several hours."
+  echo "Existing files are not touched. Takes roughly 1 hour per 64GB (longer on a slow reader)."
   read -rp "Continue? [y/N] " ans
   [[ "$ans" == [yY] ]] || exit 0
 fi
 
-# A2 check first, while mounted with free space. Spec minimums (4KiB random): A2 = 4000 read / 2000 write IOPS, A1 = 1500 / 500.
-echo "== A2 random IOPS test (fio, ~2 min) =="
-fio_iops() {  # $1 = randread|randwrite
-  fio --name=a2 --filename="$MNT/fio_a2.tmp" --size=1G --bs=4k --rw="$1" --direct=1 \
-      --ioengine=libaio --iodepth=32 --runtime=60 --time_based --output-format=json \
-    | jq -r "if \"$1\" == \"randread\" then .jobs[0].read.iops else .jobs[0].write.iops end | floor"
+# Speed tests run first, while mounted with free space. All use O_DIRECT so RAM cache doesn't inflate results.
+fio_json() {  # $1 = rw mode, $2 = block size, rest = extra fio args; prints fio JSON
+  local rw=$1 bs=$2; shift 2
+  fio --name=t --filename="$MNT/fio_test.tmp" --size=1G --bs="$bs" --rw="$rw" --direct=1 --ioengine=libaio "$@" --output-format=json
 }
-rr=$(fio_iops randread); rw=$(fio_iops randwrite)
-rm -f "$MNT/fio_a2.tmp"
-echo "Random read : $rr IOPS (A2 needs >=4000)"
-echo "Random write: $rw IOPS (A2 needs >=2000)"
-if   (( rr >= 4000 && rw >= 2000 )); then echo "Meets A2."
-elif (( rr >= 1500 && rw >= 500 ));  then echo "Only A1 level."
-else echo "Below A1."; fi
-echo "Note: A2 speed needs host Command Queue support. Most USB card readers lack it, so a genuine A2 card often scores A1-level here. Low IOPS alone is not proof of fake."
+W=err R=err RR=err RW=err SPEED_V=ERROR APP_V=ERROR
+if (( $(df --output=avail -k "$MNT" | tail -1) < 1200000 )); then
+  echo "Less than 1.2GB free; skipping speed tests."
+else
+  echo "== Speed tests (fio, ~3-5 min) =="
+  # A failed speed test must not stop the capacity test, which is the one that decides fake/genuine.
+  # jq -e: a missing field fails here instead of reaching the arithmetic below as "null".
+  if W=$(fio_json write 1M --iodepth=4 | jq -e '.jobs[0].write.bw_bytes/1e6 | floor') &&
+     R=$(fio_json read 1M --iodepth=4 | jq -e '.jobs[0].read.bw_bytes/1e6 | floor') &&
+     RR=$(fio_json randread 4k --iodepth=32 --runtime=60 --time_based | jq -e '.jobs[0].read.iops | floor') &&
+     RW=$(fio_json randwrite 4k --iodepth=32 --runtime=60 --time_based | jq -e '.jobs[0].write.iops | floor'); then
+    # Genuine cards read clearly faster than they write. If read < 1.5x write, both are stuck at the
+    # reader's ceiling, so a low result says nothing about the card: report INCONCLUSIVE, not FAIL.
+    LIMITED=0; (( R * 10 < W * 15 )) && LIMITED=1
+    if   (( REQ == 0 )); then SPEED_V=n/a
+    elif (( W >= REQ )); then SPEED_V=PASS
+    elif (( LIMITED )) || [[ $USB == 480 && $REQ -gt 30 ]]; then SPEED_V=INCONCLUSIVE
+    else SPEED_V=FAIL; fi
+    case $APP in A2) AR=4000 AW=2000 ;; A1) AR=1500 AW=500 ;; *) AR=0 AW=0 ;; esac
+    if   (( AR == 0 )); then APP_V=n/a
+    elif (( RR >= AR && RW >= AW )); then APP_V=PASS
+    elif (( LIMITED )) || [[ $APP == A2 && $USB != n/a ]]; then APP_V=INCONCLUSIVE   # A2 needs Command Queue, which USB readers lack
+    else APP_V=BELOW; fi
+  else
+    W=err R=err RR=err RW=err   # don't report half-finished numbers
+    echo "Speed test failed (see error above); continuing with the capacity test."
+  fi
+  rm -f "$MNT/fio_test.tmp"
+fi
 echo
 
+USABLE=unknown
 if (( QUICK )); then
   sync
   sudo umount "$PART"
-  echo "== f3probe (destructive) =="
+  echo "== Capacity test: f3probe (destructive) =="
   # || true: card is already unmounted/wiped, so always continue to reformat even if f3probe errors.
-  sudo f3probe --destructive --time-ops "$DISK" | tee /tmp/f3probe.log || true
-  echo
-  echo "== Verdict =="
-  if grep -q "is the real thing" /tmp/f3probe.log; then
-    echo "GENUINE capacity."
-  elif grep -q "Bad news" /tmp/f3probe.log; then
-    echo "FAKE or FAULTY: see 'usable size' above. Request a refund."
-  else
-    echo "f3probe did not finish; no verdict. Check the error above."
-  fi
+  sudo f3probe --destructive --time-ops "$DISK" | tee "$LOG/f3probe.log" || true
+  USABLE=$(sed -n 's/.*\*Usable\* size: *\([0-9.]* [A-Za-z]*\).*/\1/p' "$LOG/f3probe.log")
+  if   grep -q "is the real thing" "$LOG/f3probe.log"; then CAP_V=GENUINE
+  elif grep -q "Bad news" "$LOG/f3probe.log"; then CAP_V=FAKE
+  else CAP_V=NO-VERDICT; fi
+
   echo "== Reformatting $DISK as exFAT =="
+  # Desktop automount can grab the card during f3probe; release it so the kernel can re-read the new table.
+  sudo umount "$DISK"?* 2>/dev/null || true
   echo 'type=7' | sudo sfdisk --wipe always "$DISK"   # one MBR partition, type 7 = exFAT
   sudo partprobe "$DISK"; sudo udevadm settle
   NEWPART=$(lsblk -lnpo NAME "$DISK" | sed -n 2p)
-  [[ -n "$NEWPART" ]] || { echo "New partition not found. Re-plug the card and run: sudo mkfs.exfat ${DISK}1"; exit 1; }
-  sudo mkfs.exfat -L SDCARD "$NEWPART"
-  echo "Done. Re-plug the card to mount it."
-  exit 0
+  # Formatting at the kernel's stale offset would leave the card unreadable, so check the kernel saw the new table.
+  want=$(sudo sfdisk -d "$DISK" | sed -n 's/.*start= *\([0-9]*\).*/\1/p' | head -1)
+  if [[ -n "$NEWPART" && "$want" == "$(cat "/sys/class/block/${NEWPART##*/}/start")" ]]; then
+    sudo mkfs.exfat -L SDCARD "$NEWPART"
+  else
+    echo "WARNING: kernel did not pick up the new partition. Re-plug the card and run: sudo mkfs.exfat -L SDCARD ${NEWPART:-${DISK}1}"
+  fi
+else
+  echo "== Capacity test: f3write + f3read =="
+  # || true: a fake card can make f3write/f3read error out; still read back and judge what was written.
+  f3write "$MNT" | tee "$LOG/f3write.log" || true
+  sync   # f3read bypasses the page cache itself (posix_fadvise), so no cache drop is needed
+  f3read "$MNT" | tee "$LOG/f3read.log" || true
+  USABLE=$(sed -n 's/.*Data OK: *\([0-9.]* [A-Za-z]*\).*/\1/p' "$LOG/f3read.log")
+  # Three-way so a crashed/interrupted f3read never reads as "fake". f3read prints "Data LOST: <size> (<n> sectors)".
+  if   grep -qE "Data LOST: .*\(0 sectors\)" "$LOG/f3read.log"; then CAP_V=GENUINE
+  elif grep -q "Data LOST:" "$LOG/f3read.log"; then CAP_V=FAKE
+  else CAP_V=NO-VERDICT; fi
 fi
 
-f3write "$MNT" | tee /tmp/f3write.log
-sync
-# Drop the page cache so f3read hits the card, not RAM (needs sudo; harmless if it fails).
-sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || echo "(could not drop caches; read speed may look inflated)"
-f3read "$MNT" | tee /tmp/f3read.log
+[[ -f "$RESULTS" ]] || echo "$HEADER" > "$RESULTS"
+echo "$(date +%F\ %H:%M),$TESTER,$(hostname),$BRAND,$CLAIMED,$SPEED,$APP,$SELLER,$([[ $QUICK == 1 ]] && echo quick || echo full),$DEV_GB,${USABLE:-unknown},$CAP_V,$W,$R,$SPEED_V,$RR,$RW,$APP_V,$USB" >> "$RESULTS"
 
 echo
-echo "== Verdict =="
-grep -i "Data LOST" /tmp/f3read.log || true
-# Three-way so a crashed/interrupted f3read never reads as "fake". f3read prints "Data LOST: <size> (<n> sectors)".
-if grep -qE "Data LOST: .*\(0 sectors\)" /tmp/f3read.log; then
-  echo "GENUINE capacity: all written data read back correctly."
-elif grep -q "Data LOST:" /tmp/f3read.log; then
-  echo "FAKE or FAULTY: some data was lost/corrupted. Request a refund."
-else
-  echo "f3read did not finish; no verdict. Check the error above."
-fi
-grep -i "Average writing speed" /tmp/f3write.log || true
-grep -i "Average reading speed" /tmp/f3read.log || true
-echo "V30 means >=30 MB/s sustained write. A USB 2.0 reader caps at ~35 MB/s, so use a USB 3 reader for a fair test."
+echo "================ RESULT: $BRAND ${CLAIMED}GB $SPEED $APP ================"
+case $CAP_V in
+  GENUINE)    echo "Capacity : GENUINE (usable ${USABLE:-?})" ;;
+  FAKE)       echo "Capacity : FAKE - only ${USABLE:-?} actually works. Request a refund." ;;
+  NO-VERDICT) echo "Capacity : NO VERDICT - the test did not finish, see errors above. Logs: $LOG" ;;
+esac
+echo "Speed    : write $W MB/s, read $R MB/s -> $SPEED_V $( ((REQ)) && echo "(needs >= $REQ MB/s write)")"
+echo "App (4K) : read $RR / write $RW IOPS -> $APP_V"
+[[ $SPEED_V == INCONCLUSIVE || $APP_V == INCONCLUSIVE ]] &&
+  echo "INCONCLUSIVE = your card reader is the bottleneck. Retest with a USB 3.0 UHS-I reader or a laptop SD slot."
+echo "Only the capacity result decides fake vs genuine. Saved to $RESULTS"
+(( QUICK )) && echo "Re-plug the card to mount it."
 
-read -rp "Delete the test files (*.h2w) now? [Y/n] " del
-[[ "$del" == [nN] ]] || rm -f "$MNT"/*.h2w
+if (( ! QUICK )); then
+  read -rp "Delete the test files (*.h2w) now? [Y/n] " del
+  [[ "$del" == [nN] ]] || rm -f "$MNT"/*.h2w
+fi
