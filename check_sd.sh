@@ -63,7 +63,15 @@ PK=$(lsblk -no PKNAME "$PART")
 [[ -n "$PK" ]] || { echo "$PART has no parent disk (card has no partition table?). Cannot continue."; exit 1; }
 DISK=/dev/$PK
 is_card_disk "$PK" || { echo "$DISK is not a USB/removable/SD-slot device. Refusing to test it."; exit 1; }
+# Every test writes to the card; a locked card would otherwise run for an hour and test nothing.
+if [[ "$(cat "/sys/block/$PK/ro")" == 1 ]] || findmnt -no OPTIONS "$MNT" | grep -qE '(^|,)ro(,|$)'; then
+  echo "The card is read-only. Slide the lock switch on the card/adapter up (away from LOCK), re-insert it and retry."; exit 1
+fi
+# Create/check the results file now, so an hour-long test can't end with nowhere to save the result.
+[[ -f "$RESULTS" ]] || echo "$HEADER" > "$RESULTS" 2>/dev/null || true
+[[ -w "$RESULTS" ]] || { echo "Cannot write results file $RESULTS. Set SD_RESULTS to a writable path."; exit 1; }
 LOG=$(mktemp -d)   # fresh per run, so a verdict can never come from an older run's log
+trap 'rm -f "$MNT/fio_test.tmp"' EXIT   # don't leave the 1GB speed-test file behind on Ctrl+C
 
 DEV_BYTES=$(lsblk -bdno SIZE "$DISK")
 DEV_GB=$(awk -v b="$DEV_BYTES" 'BEGIN {printf "%.1f", b / 1e9}')
@@ -78,9 +86,11 @@ echo
 
 echo "== Describe the card (as printed on it / in the listing) =="
 # read || exit: on Ctrl-D/closed input, stop instead of looping forever on the validation prompts.
-ask() { local a; read -rp "$1: " a || exit 1; a=${a:-$2}; tr -d ',"\r\n' <<<"$a"; }   # strip CSV-breaking chars
+# Strip CSV-breaking chars, and leading = + - @ which spreadsheets would run as a formula.
+ask() { local a; read -rp "$1: " a || exit 1; a=${a:-$2}; tr -d ',"\r\n' <<<"$a" | sed 's/^[=+@-]*//'; }
 speed_req() { case $1 in V90) echo 90 ;; V60) echo 60 ;; V30|U3) echo 30 ;; V10|U1|C10) echo 10 ;; V6|C6) echo 6 ;; C4) echo 4 ;; NONE) echo 0 ;; *) return 1 ;; esac; }
-TESTER=$(ask "Your name [$USER]" "$USER")
+ME=${USER:-$(id -un)}   # $USER is unset in some shells (cron, containers); set -u would crash on it
+TESTER=$(ask "Your name [$ME]" "$ME")
 BRAND=$(ask "Brand (e.g. SanDisk, Samsung, Acer)" unknown)
 while :; do CLAIMED=$(ask "Capacity printed on the card, in GB (e.g. 64)" ""); [[ "$CLAIMED" =~ ^[1-9][0-9]*$ ]] && break; echo "  Enter a number like 64 (no leading zero)."; done
 while :; do SPEED=$(ask "Speed class: V10/V30/V60/V90, U1/U3, C10/C6/C4, or Enter for none" NONE); SPEED=${SPEED^^}
@@ -93,7 +103,9 @@ echo
 (( DEV_BYTES * 100 >= CLAIMED * 90 * 1000000000 )) || echo "WARNING: card reports only $DEV_GB GB but is labelled $CLAIMED GB."
 
 if (( QUICK )); then
-  echo "QUICK mode will ERASE EVERYTHING on $DISK and reformat it as exFAT."
+  # Any USB disk passes is_card_disk, so spell out what will be wiped in case it's a USB drive, not the card.
+  echo "QUICK mode will ERASE EVERYTHING on $DISK: $(lsblk -dno SIZE,MODEL "$DISK" | xargs), $(df -h --output=used "$MNT" | tail -1 | xargs) currently used."
+  echo "Make sure this is the SD card and not a USB drive with your data. It will be reformatted as exFAT."
   read -rp "Type the device name ($DISK) to confirm: " ans
   [[ "$ans" == "$DISK" ]] || { echo "Aborted."; exit 0; }
   sudo -v   # ask for the password now, not minutes later when the tests reach f3probe
@@ -105,6 +117,10 @@ elif (( SPEED_ONLY )); then
 else
   echo "This fills ALL free space on $MNT with test files (*.h2w), then verifies them."
   echo "Existing files are not touched. Takes roughly 1 hour per 64GB (longer on a slow reader)."
+  # f3write only tests free space; space held by existing files is never checked.
+  free_kb=$(df --output=avail -k "$MNT" | tail -1)
+  (( free_kb * 1024 * 100 >= DEV_BYTES * 90 )) ||
+    echo "WARNING: only $(( free_kb / 1000000 )) GB of $DEV_GB GB is free, so only that part gets tested. For a full check, empty the card or use --quick."
   read -rp "Continue? [y/N] " ans
   [[ "$ans" == [yY] ]] || exit 0
 fi
@@ -188,8 +204,10 @@ else
   F3W=$(sed -n 's/.*Average writing speed: *//p' "$LOG/f3write.log")
   F3R=$(sed -n 's/.*Average reading speed: *//p' "$LOG/f3read.log")
   # Three-way so a crashed/interrupted f3read never reads as "fake". f3read prints "Data LOST: <size> (<n> sectors)".
-  if   grep -qE "Data LOST: .*\(0 sectors\)" "$LOG/f3read.log"; then CAP_V=GENUINE
-  elif grep -q "Data LOST:" "$LOG/f3read.log"; then CAP_V=FAKE
+  # GENUINE also needs Data OK > 0: with nothing written, f3read still reports "Data LOST: ... (0 sectors)".
+  if   grep -qE "Data LOST: .*\(0 sectors\)" "$LOG/f3read.log" &&
+       grep -qE "Data OK: .*\([1-9][0-9]* sectors\)" "$LOG/f3read.log"; then CAP_V=GENUINE
+  elif grep -qE "Data LOST: .*\([1-9][0-9]* sectors\)" "$LOG/f3read.log"; then CAP_V=FAKE
   else CAP_V=NO-VERDICT; fi
 fi
 

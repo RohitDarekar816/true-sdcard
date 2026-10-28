@@ -122,6 +122,8 @@ usable, capacity_verdict, write_mbs, read_mbs, speed_verdict, read_iops, write_i
 ## Notes
 
 - Only USB, removable or built-in SD-slot devices are accepted, so the script can't test or wipe a system disk.
+- "The card is read-only": the lock switch on the card or its adapter is on. Slide it up, away from LOCK.
+- Full mode only tests free space. If the card is mostly full, the script warns you; empty it or use `--quick` for a complete check.
 - The speed test writes a 1GB file; cards with less than 1.2GB free skip it.
 - Full mode leaves test files (`*.h2w`) on the card; the script offers to delete them at the end.
 - If two people write to the same shared CSV at the exact same moment, a row can be garbled; per-person files + `--summary` avoids this.
