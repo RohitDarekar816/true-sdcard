@@ -23,8 +23,9 @@ chmod +x check_sd.sh
 |---|---|---|---|
 | `./check_sd.sh` | ~1 hour per 64GB | **No**, existing files are kept | capacity, speed, A1/A2 |
 | `./check_sd.sh --quick` | ~5–10 min | **Yes, everything**, then reformats it exFAT | capacity, speed, A1/A2 |
+| `./check_sd.sh --speed` | ~3–5 min | **No**, uses a 1GB temp file | speed, A1/A2 only (**no fake check**) |
 
-Use `--quick` for new, empty cards. The script finds the inserted card itself (or lets you pick if there
+Use `--quick` for new, empty cards. Use `--speed` when you only want to know how fast a card is. The script finds the inserted card itself (or lets you pick if there
 are several); you can also pass the mount point: `./check_sd.sh /media/$USER/MYCARD`.
 
 3. Answer the questions about the card, exactly as printed on the card / product listing:
@@ -42,12 +43,29 @@ Bought from (e.g. Flipkart / Amazon + seller name): Flipkart RetailNet
 
 ## Reading the result
 
+Speeds are printed as each test finishes, then summarised:
+
 ```
+== Speed tests (fio, ~3-5 min) ==
+  Sequential write (1GB, 1MB blocks)...
+    9.3 MB/s
+  Sequential read  (1GB, 1MB blocks)...
+    9.5 MB/s
+  Random read  (4KB blocks, 60s)...
+    1047 IOPS
+  Random write (4KB blocks, 60s)...
+    485 IOPS
+
 ================ RESULT: Acer 64GB V30 A1 ================
 Capacity : GENUINE (usable 58.24 GB)
-Speed    : write 9 MB/s, read 9 MB/s -> INCONCLUSIVE (needs >= 30 MB/s write)
+Speed    : write 9.3 MB/s, read 9.5 MB/s -> INCONCLUSIVE (needs >= 30 MB/s write)
+           whole-card average: write 9.30 MB/s, read 9.52 MB/s
 App (4K) : read 1047 / write 485 IOPS -> INCONCLUSIVE
 ```
+
+- **Sequential write/read** (MB/s): copying big files such as videos and photos. This is what V/U/Class ratings promise.
+- **Random read/write** (IOPS): many small reads/writes, as when apps run from the card. This is what A1/A2 promise.
+- **Whole-card average** (full mode only): f3's average over the entire card, the most realistic sustained speed.
 
 **Capacity is the only line that decides fake vs genuine.**
 
@@ -56,6 +74,7 @@ App (4K) : read 1047 / write 485 IOPS -> INCONCLUSIVE
 | `GENUINE` | Every byte the card claims works. A "64GB" card shows ~58 GiB / ~62 GB; that is normal. |
 | `FAKE` | Only the "usable" size actually stores data. Return the card / request a refund. |
 | `NO-VERDICT` | The test didn't finish (error, unplugged, Ctrl+C). Run it again. |
+| `NOT-TESTED` | A `--speed` run. Not counted in `--summary`. |
 
 | Speed / App | Meaning |
 |---|---|

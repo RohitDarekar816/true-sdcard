@@ -3,11 +3,12 @@
 # random IOPS (A1/A2) against what the card claims, and appends one row per card to a results CSV.
 #
 # Usage:
-#   ./check_sd.sh [--quick] [mount_point]   test a card (no mount point = pick from inserted cards)
-#   ./check_sd.sh --summary [csv ...]       count genuine/fake cards across result files
+#   ./check_sd.sh [--quick|--speed] [mount_point]   test a card (no mount point = pick from inserted cards)
+#   ./check_sd.sh --summary [csv ...]               count genuine/fake cards across result files
 #
 #   default : fills free space with test files and verifies them (keeps your files, ~1 hour per 64GB)
 #   --quick : f3probe --destructive on the raw device (WIPES the card, minutes), then reformats it exFAT
+#   --speed : read/write speed tests only, no fake check (keeps your files, ~3-5 min)
 #
 # Results go to $SD_RESULTS (default: sd_results.csv next to this script). Point it at a shared folder
 # so the whole team's results land in one file, or collect everyone's files and run --summary on them.
@@ -22,6 +23,7 @@ if [[ "${1:-}" == "--summary" ]]; then
   (( $# )) || set -- "$RESULTS"
   for f in "$@"; do [[ -f "$f" ]] || { echo "No results file: $f"; exit 1; }; done
   awk -F, 'FNR==1 {next}
+    $12=="NOT-TESTED" {next}   # --speed runs never checked capacity, so they cannot count as genuine or fake
     {n++; v[$12]++; k=tolower($4" / "$8); t[k]++; if ($12=="FAKE") f[k]++}
     END {
       if (!n) {print "No results yet."; exit}
@@ -33,8 +35,8 @@ if [[ "${1:-}" == "--summary" ]]; then
   exit 0
 fi
 
-QUICK=0
-[[ "${1:-}" == "--quick" ]] && { QUICK=1; shift; }
+QUICK=0 SPEED_ONLY=0
+case "${1:-}" in --quick) QUICK=1; shift ;; --speed) SPEED_ONLY=1; shift ;; esac
 
 for c in f3write f3read f3probe fio jq mkfs.exfat; do
   command -v "$c" >/dev/null || { echo "$c not installed. Run: sudo apt install f3 fio jq exfatprogs"; exit 1; }
@@ -95,6 +97,11 @@ if (( QUICK )); then
   read -rp "Type the device name ($DISK) to confirm: " ans
   [[ "$ans" == "$DISK" ]] || { echo "Aborted."; exit 0; }
   sudo -v   # ask for the password now, not minutes later when the tests reach f3probe
+elif (( SPEED_ONLY )); then
+  echo "Speed test writes a 1GB temporary file (deleted afterwards). Existing files are not touched. ~3-5 min."
+  echo "This does NOT check whether the card is fake; run without --speed for that."
+  read -rp "Continue? [y/N] " ans
+  [[ "$ans" == [yY] ]] || exit 0
 else
   echo "This fills ALL free space on $MNT with test files (*.h2w), then verifies them."
   echo "Existing files are not touched. Takes roughly 1 hour per 64GB (longer on a slow reader)."
@@ -114,15 +121,20 @@ else
   echo "== Speed tests (fio, ~3-5 min) =="
   # A failed speed test must not stop the capacity test, which is the one that decides fake/genuine.
   # jq -e: a missing field fails here instead of reaching the arithmetic below as "null".
-  if W=$(fio_json write 1M --iodepth=4 | jq -e '.jobs[0].write.bw_bytes/1e6 | floor') &&
-     R=$(fio_json read 1M --iodepth=4 | jq -e '.jobs[0].read.bw_bytes/1e6 | floor') &&
-     RR=$(fio_json randread 4k --iodepth=32 --runtime=60 --time_based | jq -e '.jobs[0].read.iops | floor') &&
-     RW=$(fio_json randwrite 4k --iodepth=32 --runtime=60 --time_based | jq -e '.jobs[0].write.iops | floor'); then
+  if echo "  Sequential write (1GB, 1MB blocks)..." &&
+     W=$(fio_json write 1M --iodepth=4 | jq -e '.jobs[0].write.bw_bytes/1e5 | floor/10') && echo "    $W MB/s" &&
+     echo "  Sequential read  (1GB, 1MB blocks)..." &&
+     R=$(fio_json read 1M --iodepth=4 | jq -e '.jobs[0].read.bw_bytes/1e5 | floor/10') && echo "    $R MB/s" &&
+     echo "  Random read  (4KB blocks, 60s)..." &&
+     RR=$(fio_json randread 4k --iodepth=32 --runtime=60 --time_based | jq -e '.jobs[0].read.iops | floor') && echo "    $RR IOPS" &&
+     echo "  Random write (4KB blocks, 60s)..." &&
+     RW=$(fio_json randwrite 4k --iodepth=32 --runtime=60 --time_based | jq -e '.jobs[0].write.iops | floor') && echo "    $RW IOPS"; then
+    WI=${W%.*} RI=${R%.*}   # whole MB/s for bash integer comparisons
     # Genuine cards read clearly faster than they write. If read < 1.5x write, both are stuck at the
     # reader's ceiling, so a low result says nothing about the card: report INCONCLUSIVE, not FAIL.
-    LIMITED=0; (( R * 10 < W * 15 )) && LIMITED=1
+    LIMITED=0; (( RI * 10 < WI * 15 )) && LIMITED=1
     if   (( REQ == 0 )); then SPEED_V=n/a
-    elif (( W >= REQ )); then SPEED_V=PASS
+    elif (( WI >= REQ )); then SPEED_V=PASS
     elif (( LIMITED )) || [[ $USB == 480 && $REQ -gt 30 ]]; then SPEED_V=INCONCLUSIVE
     else SPEED_V=FAIL; fi
     case $APP in A2) AR=4000 AW=2000 ;; A1) AR=1500 AW=500 ;; *) AR=0 AW=0 ;; esac
@@ -138,8 +150,10 @@ else
 fi
 echo
 
-USABLE=unknown
-if (( QUICK )); then
+USABLE=unknown F3W="" F3R=""
+if (( SPEED_ONLY )); then
+  CAP_V=NOT-TESTED
+elif (( QUICK )); then
   sync
   sudo umount "$PART"
   echo "== Capacity test: f3probe (destructive) =="
@@ -170,6 +184,9 @@ else
   sync   # f3read bypasses the page cache itself (posix_fadvise), so no cache drop is needed
   f3read "$MNT" | tee "$LOG/f3read.log" || true
   USABLE=$(sed -n 's/.*Data OK: *\([0-9.]* [A-Za-z]*\).*/\1/p' "$LOG/f3read.log")
+  # Whole-card averages: closer to real sustained speed than the 1GB fio test.
+  F3W=$(sed -n 's/.*Average writing speed: *//p' "$LOG/f3write.log")
+  F3R=$(sed -n 's/.*Average reading speed: *//p' "$LOG/f3read.log")
   # Three-way so a crashed/interrupted f3read never reads as "fake". f3read prints "Data LOST: <size> (<n> sectors)".
   if   grep -qE "Data LOST: .*\(0 sectors\)" "$LOG/f3read.log"; then CAP_V=GENUINE
   elif grep -q "Data LOST:" "$LOG/f3read.log"; then CAP_V=FAKE
@@ -177,7 +194,7 @@ else
 fi
 
 [[ -f "$RESULTS" ]] || echo "$HEADER" > "$RESULTS"
-echo "$(date +%F\ %H:%M),$TESTER,$(hostname),$BRAND,$CLAIMED,$SPEED,$APP,$SELLER,$([[ $QUICK == 1 ]] && echo quick || echo full),$DEV_GB,${USABLE:-unknown},$CAP_V,$W,$R,$SPEED_V,$RR,$RW,$APP_V,$USB" >> "$RESULTS"
+echo "$(date +%F\ %H:%M),$TESTER,$(hostname),$BRAND,$CLAIMED,$SPEED,$APP,$SELLER,$( ((QUICK)) && echo quick || { ((SPEED_ONLY)) && echo speed || echo full; }),$DEV_GB,${USABLE:-unknown},$CAP_V,$W,$R,$SPEED_V,$RR,$RW,$APP_V,$USB" >> "$RESULTS"
 
 echo
 echo "================ RESULT: $BRAND ${CLAIMED}GB $SPEED $APP ================"
@@ -185,15 +202,17 @@ case $CAP_V in
   GENUINE)    echo "Capacity : GENUINE (usable ${USABLE:-?})" ;;
   FAKE)       echo "Capacity : FAKE - only ${USABLE:-?} actually works. Request a refund." ;;
   NO-VERDICT) echo "Capacity : NO VERDICT - the test did not finish, see errors above. Logs: $LOG" ;;
+  NOT-TESTED) echo "Capacity : not tested (--speed run). Run without --speed to check for a fake card." ;;
 esac
 echo "Speed    : write $W MB/s, read $R MB/s -> $SPEED_V $( ((REQ)) && echo "(needs >= $REQ MB/s write)")"
+[[ -n "$F3W$F3R" ]] && echo "           whole-card average: write ${F3W:-?}, read ${F3R:-?}"
 echo "App (4K) : read $RR / write $RW IOPS -> $APP_V"
 [[ $SPEED_V == INCONCLUSIVE || $APP_V == INCONCLUSIVE ]] &&
   echo "INCONCLUSIVE = your card reader is the bottleneck. Retest with a USB 3.0 UHS-I reader or a laptop SD slot."
 echo "Only the capacity result decides fake vs genuine. Saved to $RESULTS"
 (( QUICK )) && echo "Re-plug the card to mount it."
 
-if (( ! QUICK )); then
+if (( ! QUICK && ! SPEED_ONLY )); then
   read -rp "Delete the test files (*.h2w) now? [Y/n] " del
   [[ "$del" == [nN] ]] || rm -f "$MNT"/*.h2w
 fi
